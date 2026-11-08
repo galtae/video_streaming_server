@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>스트리밍 실습</title>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.13/dist/hls.min.js"></script>
+<style>
+  :root { --bg:#111418; --panel:#1b2027; --line:#2c333d; --text:#e6e9ee; --dim:#8b95a3; --acc:#4da3ff; --ok:#3ecf8e; --warn:#f0b429; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, "Malgun Gothic", sans-serif; background:var(--bg); color:var(--text); }
+  header { padding:14px 20px; border-bottom:1px solid var(--line); display:flex; gap:16px; align-items:center; flex-wrap:wrap; }
+  header h1 { font-size:18px; margin:0 12px 0 0; }
+  select, button { background:var(--panel); color:var(--text); border:1px solid var(--line); border-radius:6px; padding:6px 10px; font-size:14px; }
+  button.active { border-color:var(--acc); color:var(--acc); }
+  main { display:grid; grid-template-columns: minmax(0,1.3fr) minmax(0,1fr); gap:16px; padding:16px 20px; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px; }
+  video { width:100%; background:#000; border-radius:6px; }
+  .desc { color:var(--dim); font-size:13px; line-height:1.6; margin:10px 0 0; }
+  .desc b { color:var(--text); }
+  .stats { display:grid; grid-template-columns: repeat(auto-fit, minmax(130px,1fr)); gap:8px; margin-top:12px; }
+  .stat { background:var(--bg); border-radius:6px; padding:8px 10px; }
+  .stat .k { font-size:11px; color:var(--dim); }
+  .stat .v { font-size:15px; margin-top:2px; font-variant-numeric: tabular-nums; }
+  .bar { position:relative; height:14px; background:var(--bg); border-radius:4px; margin-top:12px; overflow:hidden; }
+  .bar .buf { position:absolute; top:0; bottom:0; background:#2f5f8f; }
+  .bar .head { position:absolute; top:0; bottom:0; width:2px; background:var(--warn); }
+  .barlabel { font-size:11px; color:var(--dim); margin-top:4px; }
+  #log { height: calc(100vh - 170px); min-height:300px; overflow:auto; font-family: Consolas, monospace; font-size:12px; line-height:1.55; }
+  #log div { white-space:pre-wrap; word-break:break-all; border-bottom:1px solid #20262e; padding:2px 0; }
+  .t { color:var(--dim); }
+  .RANGE { color:var(--acc); } .HLS { color:var(--ok); } .SERVER { color:var(--warn); }
+  .loghead { display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🎬 스트리밍 실습</h1>
+  <label>영상 <select id="videoSel"></select></label>
+  <span>
+    <button id="btnRange" class="active">① HTTP Range</button>
+    <button id="btnHls">② HLS</button>
+  </span>
+  <label>네트워크 속도
+    <select id="throttle">
+      <option value="0">제한 없음</option>
+      <option value="2000">2 MB/s</option>
+      <option value="500">500 KB/s</option>
+      <option value="250">250 KB/s (720p 버거움)</option>
+      <option value="100">100 KB/s (매우 느림)</option>
+    </select>
+  </label>
+</header>
+
+<main>
+  <section class="panel">
+    <video id="video" controls muted playsinline></video>
+    <div class="bar" id="bar"></div>
+    <div class="barlabel">파란색 = 브라우저가 받아 둔 버퍼, 노란선 = 현재 재생 위치</div>
+    <div class="stats" id="stats"></div>
+    <p class="desc" id="desc"></p>
+  </section>
+
+  <section class="panel">
+    <div class="loghead"><b>서버 요청 로그 (실시간)</b><button id="clear">지우기</button></div>
+    <div id="log"></div>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const video = $('video');
+let mode = 'range';
+let videos = [];
+let hls = null;
+
+const DESC = {
+  range: `<b>HTTP Range 방식</b>: mp4 파일 <b>하나</b>를 바이트 범위로 나눠 받습니다.
+    브라우저가 <code>Range: bytes=시작-</code> 헤더로 요청하면 서버는 <b>206 Partial Content</b>로 일부만 보냅니다.
+    재생 바를 뒤로 크게 건너뛰어 보세요. 해당 위치의 바이트 범위를 새로 요청합니다.
+    단점: 화질이 하나로 고정되어, 네트워크가 느려지면 그냥 멈춥니다.`,
+  hls: `<b>HLS 방식</b>: 영상을 미리 <b>4초짜리 .ts 조각</b>으로 잘라 두고 <b>.m3u8 재생목록</b>으로 순서를 알려줍니다.
+    ① master.m3u8 (화질 목록) → ② 화질별 index.m3u8 (조각 목록) → ③ seg_000.ts, seg_001.ts ... 순서로 받습니다.
+    네트워크 속도를 250KB/s로 낮춰 보세요. 플레이어가 <b>720p에서 360p 조각으로 자동 전환</b>합니다(ABR).
+    YouTube, Netflix 같은 서비스가 쓰는 원리입니다(DASH도 구조는 같습니다).`,
+};
+
+// ── 서버 로그 수신 (SSE) ──
+const logEl = $('log');
+new EventSource('/events').onmessage = (e) => {
+  const { time, type, message } = JSON.parse(e.data);
+  const d = document.createElement('div');
+  d.innerHTML = `<span class="t">${time}</span> <span class="${type}">[${type}]</span> `;
+  d.appendChild(document.createTextNode(message));
+  const atBottom = logEl.scrollTop + logEl.clientHeight >= logEl.scrollHeight - 20;
+  logEl.appendChild(d);
+  if (logEl.children.length > 500) logEl.firstChild.remove();
+  if (atBottom) logEl.scrollTop = logEl.scrollHeight;
+};
+$('clear').onclick = () => (logEl.innerHTML = '');
+
+// ── 속도 제한 ──
+$('throttle').onchange = (e) => fetch('/api/throttle?kbps=' + e.target.value, { method: 'POST' });
+fetch('/api/throttle').then((r) => r.json()).then((d) => ($('throttle').value = String(d.kbps)));
+
+// ── 재생 ──
+function load() {
+  const v = videos.find((x) => x.file === $('videoSel').value);
+  if (hls) { hls.destroy(); hls = null; }
+  video.removeAttribute('src'); video.load();
+  $('desc').innerHTML = DESC[mode];
+  if (!v) return;
+
+  if (mode === 'range') {
+    // <video src>에 그냥 URL만 주면, 브라우저가 알아서 Range 요청을 보냅니다.
+    video.src = '/video/' + encodeURIComponent(v.file);
+  } else {
+    if (!v.hls) {
+      $('desc').innerHTML = `⚠️ 이 영상은 HLS 변환이 안 되어 있습니다. 터미널에서 <code>npm run hls</code>를 실행한 뒤 새로고침하세요.`;
+      return;
+    }
+    if (window.Hls && Hls.isSupported()) {
+      // Chrome 등은 HLS를 직접 재생하지 못하므로 hls.js가 조각을 받아 MSE(Media Source Extensions)로 넣어 줍니다.
+      hls = new Hls();
+      hls.loadSource(v.hls);
+      hls.attachMedia(video);
+      hls.on(Hls.Events.LEVEL_SWITCHED, (_, d) => {
+        const lv = hls.levels[d.level];
+        addLocalLog(`화질 전환 → ${lv.height}p (${Math.round(lv.bitrate / 1000)}kbps)`);
+      });
+    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      video.src = v.hls; // Safari는 HLS를 기본 지원합니다.
+    }
+  }
+  video.play().catch(() => {});
+}
+
+function addLocalLog(msg) {
+  const d = document.createElement('div');
+  d.innerHTML = `<span class="t">${new Date().toISOString().slice(11, 23)}</span> <span style="color:#ff7ab6">[PLAYER]</span> `;
+  d.appendChild(document.createTextNode(msg));
+  logEl.appendChild(d);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function setMode(m) {
+  mode = m;
+  $('btnRange').classList.toggle('active', m === 'range');
+  $('btnHls').classList.toggle('active', m === 'hls');
+  load();
+}
+$('btnRange').onclick = () => setMode('range');
+$('btnHls').onclick = () => setMode('hls');
+$('videoSel').onchange = load;
+
+// ── 버퍼 시각화 / 상태 표시 ──
+function render() {
+  const dur = video.duration || 0;
+  const bar = $('bar');
+  bar.innerHTML = '';
+  let ahead = 0;
+  for (let i = 0; i < video.buffered.length; i++) {
+    const s = video.buffered.start(i), e = video.buffered.end(i);
+    if (dur) {
+      const b = document.createElement('div');
+      b.className = 'buf';
+      b.style.left = (s / dur * 100) + '%';
+      b.style.width = ((e - s) / dur * 100) + '%';
+      bar.appendChild(b);
+    }
+    if (video.currentTime >= s && video.currentTime <= e) ahead = e - video.currentTime;
+  }
+  if (dur) {
+    const h = document.createElement('div');
+    h.className = 'head';
+    h.style.left = (video.currentTime / dur * 100) + '%';
+    bar.appendChild(h);
+  }
+  const quality = hls && hls.currentLevel >= 0 && hls.levels[hls.currentLevel]
+    ? hls.levels[hls.currentLevel].height + 'p'
+    : (video.videoHeight ? video.videoHeight + 'p' : '-');
+  const stats = [
+    ['재생 위치', `${video.currentTime.toFixed(1)} / ${dur ? dur.toFixed(1) : '-'}초`],
+    ['앞쪽 버퍼', ahead.toFixed(1) + '초'],
+    ['현재 화질', quality],
+    ['상태', video.paused ? '일시정지' : (video.readyState < 3 ? '⏳ 버퍼링' : '▶ 재생 중')],
+  ];
+  if (hls) stats.push(['추정 대역폭', Math.round(hls.bandwidthEstimate / 1000) + ' kbps']);
+  $('stats').innerHTML = stats.map(([k, v]) => `<div class="stat"><div class="k">${k}</div><div class="v">${v}</div></div>`).join('');
+  requestAnimationFrame(render);
+}
+
+fetch('/api/videos').then((r) => r.json()).then((list) => {
+  videos = list;
+  $('videoSel').innerHTML = list.length
+    ? list.map((v) => `<option>${v.file}</option>`).join('')
+    : '<option value="">(영상 없음: npm run setup)</option>';
+  load();
+  render();
+});
+</script>
+</body>
+</html>

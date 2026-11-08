@@ -1,0 +1,12 @@
+{
+  "name": "video-streaming-server",
+  "version": "1.0.0",
+  "description": "공부용 동영상 스트리밍 서버 (HTTP Range + HLS)",
+  "private": true,
+  "scripts": {
+    "start": "node server.js",
+    "sample": "node scripts/make-sample.js",
+    "hls": "node scripts/convert-hls.js",
+    "setup": "node scripts/make-sample.js && node scripts/convert-hls.js"
+  }
+}
